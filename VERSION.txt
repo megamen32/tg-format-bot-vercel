@@ -1,0 +1,8 @@
+version: v2-inline-settings-merge-separators
+built_at: 2026-05-30
+changes:
+- /settings uses inline keyboard buttons
+- mergeEntities setting defaults to true
+- removeAiSeparators setting defaults to true
+- reads Telegram message.entities / caption_entities and merges them into output
+- removes AI paragraph separators: —, ---, ___, ***

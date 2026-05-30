@@ -6,6 +6,8 @@
 
 - режим: `auto`
 - автозамены невозможных/неподдерживаемых конструкций: `on`
+- merge исходного Telegram-форматирования: `on`
+- удаление AI-разделителей между абзацами: `on`
 
 ## Что умеет
 
@@ -21,8 +23,28 @@
 - чеклисты → `☑` / `☐`
 - LaTeX `$...$` / `$$...$$` → моноширинный текст, потому что Telegram не рендерит LaTeX
 - удаление неподдерживаемого HTML
+- сохранение исходного Telegram-форматирования из `message.entities`, если пользователь отправил текст с жирным, курсивом, ссылками, кодом и т.д.
+- удаление разделителей, которые часто вставляют ИИ между абзацами: `—`, `---`, `___`, `***`
 
-## Команды бота
+## Настройки
+
+Открой:
+
+```text
+/settings
+```
+
+Бот покажет inline-кнопки:
+
+- `Авто`
+- `HTML`
+- `Markdown`
+- `TelegramMarkdown`
+- `Автозамены`
+- `Merge Telegram-форматирования`
+- `Убирать разделители ИИ`
+
+Старые текстовые команды тоже работают:
 
 ```text
 /start
@@ -34,6 +56,10 @@
 /mode tgmd
 /replace on
 /replace off
+/merge on
+/merge off
+/separators on
+/separators off
 ```
 
 Режимы:
@@ -42,6 +68,14 @@
 - `html` — вход считается HTML
 - `md` — вход считается обычным Markdown
 - `tgmd` — вход считается Telegram MarkdownV2
+
+## Как работает merge Telegram-форматирования
+
+Telegram присылает боту не только `message.text`, но и `message.entities`: жирный, курсив, подчёркивание, зачёркивание, спойлеры, код, ссылки и т.д.
+
+Когда настройка `Merge Telegram-форматирования` включена, бот сначала встраивает эти entities в исходный текст как Telegram HTML, а потом дополнительно парсит Markdown. Это нужно для случаев, когда часть форматирования Telegram уже распознал сам, а часть осталась Markdown-текстом вроде `## Заголовок`, таблиц или чеклистов.
+
+Ограничение: в режиме `HTML` вход считается уже готовым HTML, поэтому entities не накладываются поверх него. В режиме `TelegramMarkdown` текст отправляется как MarkdownV2 без дополнительного merge.
 
 ## Установка
 
@@ -65,23 +99,16 @@ TELEGRAM_SECRET_TOKEN=любая_длинная_строка_по_желанию
 
 ## Webhook
 
-После деплоя выполни:
+После деплоя выполни одной строкой:
 
 ```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://YOUR_PROJECT.vercel.app/api/bot",
-    "secret_token": "YOUR_TELEGRAM_SECRET_TOKEN"
-  }'
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://YOUR_PROJECT.vercel.app/api/bot","secret_token":"YOUR_TELEGRAM_SECRET_TOKEN"}'
 ```
 
 Если не используешь `TELEGRAM_SECRET_TOKEN`, убери поле `secret_token`:
 
 ```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://YOUR_PROJECT.vercel.app/api/bot"}'
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://YOUR_PROJECT.vercel.app/api/bot"}'
 ```
 
 Проверить webhook:

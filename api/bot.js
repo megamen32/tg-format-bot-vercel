@@ -9,13 +9,22 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST
 
 const DEFAULT_SETTINGS = {
   mode: 'auto', // auto | html | tgmd | md
-  replaceBad: true
+  replaceBad: true,
+  mergeEntities: true,
+  removeAiSeparators: true
 };
 
 const memorySettings = new Map();
 
 const md = new MarkdownIt({
   html: false,
+  linkify: true,
+  typographer: true,
+  breaks: false
+});
+
+const mdWithHtml = new MarkdownIt({
+  html: true,
   linkify: true,
   typographer: true,
   breaks: false
@@ -43,25 +52,62 @@ function stripControlChars(text = '') {
     .replace(/\r\n?/g, '\n');
 }
 
-function normalizeLLMMarkdown(text = '', replaceBad = true) {
+function isFenceLine(line = '') {
+  return /^\s*(```|~~~)/.test(line);
+}
+
+function isAiSeparatorLine(line = '') {
+  return /^\s*(?:-{3,}|[—–]{1,}|_{3,}|\*{3,})\s*$/.test(line);
+}
+
+function normalizeAiSeparators(text = '', { removeAiSeparators = true, replaceBad = true } = {}) {
+  const lines = String(text).split('\n');
+  const out = [];
+  let inFence = false;
+
+  for (const line of lines) {
+    if (isFenceLine(line)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+
+    if (!inFence && isAiSeparatorLine(line)) {
+      if (removeAiSeparators) continue;
+      out.push(replaceBad ? '────────' : line);
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
+}
+
+function normalizeLLMMarkdown(text = '', settings = DEFAULT_SETTINGS) {
+  const replaceBad = settings.replaceBad !== false;
   let s = stripControlChars(text).trim();
 
-  // Normalize separators often emitted by LLMs.
-  s = s.replace(/^[—–-]{3,}\s*$/gm, '\n---\n');
+  s = normalizeAiSeparators(s, settings);
 
-  if (!replaceBad) return s;
+  if (!replaceBad) {
+    return compactPlainNewlines(s);
+  }
 
   // Telegram HTML has no headings, tables, task lists or math renderer.
   // We keep the meaning and convert unsupported visual markers into readable Markdown first.
   s = s.replace(/^#{1,6}\s+(.+)$/gm, (_, title) => `**${title.trim()}**`);
   s = s.replace(/^\s*[-*+]\s+\[(x|X)\]\s+/gm, '☑ ');
   s = s.replace(/^\s*[-*+]\s+\[ \]\s+/gm, '☐ ');
-  s = s.replace(/^\s*([*_-]){3,}\s*$/gm, '────────');
   s = s.replace(/\$\$([\s\S]*?)\$\$/g, (_, expr) => `\n\`\`\`text\n${expr.trim()}\n\`\`\`\n`);
   s = s.replace(/\$([^\n$]+)\$/g, (_, expr) => `\`${expr.trim()}\``);
   s = s.replace(/^\[\s*$/gm, '```text');
   s = s.replace(/^\]\s*$/gm, '```');
-  return s;
+  return compactPlainNewlines(s);
+}
+
+function compactPlainNewlines(text = '') {
+  return String(text).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function looksLikeHtml(text = '') {
@@ -134,8 +180,20 @@ function renderNode(node, ctx = {}) {
       }
       return inner();
     }
-    case 'code': return `<code>${escapeHtml(decodeBasicEntities(textContent(node)))}</code>`;
-    case 'pre': return `<pre>${escapeHtml(decodeBasicEntities(textContent(node)).replace(/^\n+|\n+$/g, ''))}</pre>\n\n`;
+    case 'code': {
+      const cls = getAttr(node, 'class') || '';
+      const lang = cls.match(/language-([a-z0-9_+-]+)/i)?.[1];
+      if (ctx.insidePre && lang) {
+        return `<code class="language-${escapeHtml(lang)}">${escapeHtml(decodeBasicEntities(textContent(node)))}</code>`;
+      }
+      return `<code>${escapeHtml(decodeBasicEntities(textContent(node)))}</code>`;
+    }
+    case 'pre': {
+      const children = getChildren(node) || [];
+      const code = children.find((child) => isTag(child) && child.name.toLowerCase() === 'code');
+      if (code) return `<pre>${renderNode(code, { ...ctx, insidePre: true })}</pre>\n\n`;
+      return `<pre>${escapeHtml(decodeBasicEntities(textContent(node)).replace(/^\n+|\n+$/g, ''))}</pre>\n\n`;
+    }
     case 'blockquote': return block(`<blockquote>${inner().trim()}</blockquote>`);
     case 'br': return '\n';
     case 'hr': return '────────\n\n';
@@ -175,7 +233,7 @@ function renderNode(node, ctx = {}) {
 }
 
 function compactTelegramHtml(html = '') {
-  return html
+  return String(html)
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -186,14 +244,88 @@ function htmlToTelegramHtml(html = '') {
   return compactTelegramHtml(renderChildren(doc));
 }
 
-function markdownToTelegramHtml(text = '', replaceBad = true) {
-  const normalized = normalizeLLMMarkdown(text, replaceBad);
-  const rendered = md.render(normalized);
-  return htmlToTelegramHtml(rendered);
+function entityTags(entity = {}) {
+  switch (entity.type) {
+    case 'bold': return ['<b>', '</b>'];
+    case 'italic': return ['<i>', '</i>'];
+    case 'underline': return ['<u>', '</u>'];
+    case 'strikethrough': return ['<s>', '</s>'];
+    case 'spoiler': return ['<tg-spoiler>', '</tg-spoiler>'];
+    case 'code': return ['<code>', '</code>'];
+    case 'pre': {
+      const lang = entity.language ? ` class="language-${escapeHtml(entity.language)}"` : '';
+      return [`<pre><code${lang}>`, '</code></pre>'];
+    }
+    case 'text_link': {
+      if (!entity.url || !/^(https?:\/\/|tg:\/\/user\?id=)/i.test(entity.url)) return null;
+      return [`<a href="${escapeHtml(entity.url)}">`, '</a>'];
+    }
+    case 'text_mention': {
+      const id = entity.user?.id;
+      if (!id) return null;
+      return [`<a href="tg://user?id=${escapeHtml(id)}">`, '</a>'];
+    }
+    default:
+      return null;
+  }
 }
 
-function markdownV2EscapePlain(text = '') {
-  return stripControlChars(text).replace(/([_\*\[\]\(\)~`>#+\-=|{}.!\\])/g, '\\$1');
+function applyTelegramEntitiesAsHtml(text = '', entities = []) {
+  const cleanText = stripControlChars(text);
+  const usable = (entities || [])
+    .map((entity, index) => ({ ...entity, index, end: entity.offset + entity.length, tags: entityTags(entity) }))
+    .filter((entity) => entity.tags && Number.isFinite(entity.offset) && Number.isFinite(entity.end) && entity.end > entity.offset)
+    .sort((a, b) => a.offset - b.offset || b.end - a.end || a.index - b.index);
+
+  if (!usable.length) return cleanText;
+
+  const starts = new Map();
+  const ends = new Map();
+  for (const entity of usable) {
+    if (!starts.has(entity.offset)) starts.set(entity.offset, []);
+    if (!ends.has(entity.end)) ends.set(entity.end, []);
+    starts.get(entity.offset).push(entity);
+    ends.get(entity.end).push(entity);
+  }
+
+  for (const value of starts.values()) value.sort((a, b) => b.end - a.end || a.index - b.index);
+  for (const value of ends.values()) value.sort((a, b) => b.offset - a.offset || b.index - a.index);
+
+  const points = [...new Set([0, cleanText.length, ...starts.keys(), ...ends.keys()])]
+    .filter((point) => point >= 0 && point <= cleanText.length)
+    .sort((a, b) => a - b);
+
+  let out = '';
+  let active = 0;
+
+  for (let i = 0; i < points.length; i++) {
+    const point = points[i];
+
+    for (const entity of ends.get(point) || []) {
+      out += entity.tags[1];
+      active = Math.max(0, active - 1);
+    }
+
+    for (const entity of starts.get(point) || []) {
+      out += entity.tags[0];
+      active += 1;
+    }
+
+    const next = points[i + 1];
+    if (next === undefined || next <= point) continue;
+    const piece = cleanText.slice(point, next);
+    out += active > 0 ? escapeHtml(piece) : piece;
+  }
+
+  return out;
+}
+
+function markdownToTelegramHtml(text = '', settings = DEFAULT_SETTINGS, entities = []) {
+  const canMergeEntities = settings.mergeEntities !== false && Array.isArray(entities) && entities.length > 0;
+  const source = canMergeEntities ? applyTelegramEntitiesAsHtml(text, entities) : text;
+  const normalized = normalizeLLMMarkdown(source, settings);
+  const rendered = canMergeEntities ? mdWithHtml.render(normalized) : md.render(normalized);
+  return htmlToTelegramHtml(rendered);
 }
 
 function chooseMode(text, settings) {
@@ -203,11 +335,11 @@ function chooseMode(text, settings) {
   return 'md';
 }
 
-function convertMessage(text, settings) {
+function convertMessage(text, settings, entities = []) {
   const mode = chooseMode(text, settings);
   if (mode === 'html') return { text: htmlToTelegramHtml(text), parse_mode: 'HTML' };
   if (mode === 'tgmd') return { text: stripControlChars(text).trim(), parse_mode: 'MarkdownV2' };
-  return { text: markdownToTelegramHtml(text, settings.replaceBad), parse_mode: 'HTML' };
+  return { text: markdownToTelegramHtml(text, settings, entities), parse_mode: 'HTML' };
 }
 
 function plainTextFromHtmlish(text = '') {
@@ -267,31 +399,106 @@ async function getSettings(chatId) {
 
 async function saveSettings(chatId, settings) {
   const key = `settings:${chatId}`;
-  memorySettings.set(key, settings);
-  await kvSet(key, settings).catch(() => false);
+  const normalized = { ...DEFAULT_SETTINGS, ...settings };
+  memorySettings.set(key, normalized);
+  await kvSet(key, normalized).catch(() => false);
+}
+
+function onOff(value) {
+  return value ? 'on' : 'off';
+}
+
+function modeLabel(mode) {
+  return {
+    auto: 'Авто',
+    html: 'HTML',
+    md: 'Markdown',
+    tgmd: 'TelegramMarkdown'
+  }[mode] || mode;
+}
+
+function mark(label, active) {
+  return active ? `✓ ${label}` : label;
+}
+
+function settingsText(settings) {
+  return [
+    '<b>Настройки форматирования</b>',
+    '',
+    `Парсить как: <b>${escapeHtml(modeLabel(settings.mode))}</b>`,
+    `Автозамены несовместимого: <b>${onOff(settings.replaceBad)}</b>`,
+    `Merge исходного Telegram-форматирования: <b>${onOff(settings.mergeEntities)}</b>`,
+    `Убирать разделители ИИ: <b>${onOff(settings.removeAiSeparators)}</b>`,
+    '',
+    '<i>Пришли текст — я верну его уже отформатированным для Telegram.</i>'
+  ].join('\n');
+}
+
+function settingsKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [
+        { text: mark('Авто', settings.mode === 'auto'), callback_data: 's:mode:auto' },
+        { text: mark('HTML', settings.mode === 'html'), callback_data: 's:mode:html' }
+      ],
+      [
+        { text: mark('Markdown', settings.mode === 'md'), callback_data: 's:mode:md' },
+        { text: mark('TelegramMarkdown', settings.mode === 'tgmd'), callback_data: 's:mode:tgmd' }
+      ],
+      [
+        { text: `${settings.replaceBad ? '✓' : '×'} Автозамены`, callback_data: 's:toggle:replaceBad' }
+      ],
+      [
+        { text: `${settings.mergeEntities ? '✓' : '×'} Merge Telegram-форматирования`, callback_data: 's:toggle:mergeEntities' }
+      ],
+      [
+        { text: `${settings.removeAiSeparators ? '✓' : '×'} Убирать разделители ИИ`, callback_data: 's:toggle:removeAiSeparators' }
+      ]
+    ]
+  };
+}
+
+async function sendSettings(chatId) {
+  const settings = await getSettings(chatId);
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: settingsText(settings),
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: settingsKeyboard(settings)
+  });
 }
 
 function helpText(settings) {
   return [
     '<b>Бот форматирования</b>',
     '',
-    'Пришли текст в Markdown или HTML. Я верну его как красиво отформатированное Telegram-сообщение.',
+    'Пришли текст в Markdown, HTML или Telegram MarkdownV2. Я верну его как красиво отформатированное Telegram-сообщение.',
     '',
     '<b>Текущие настройки</b>',
-    `Режим: <code>${settings.mode}</code>`,
-    `Автозамены: <code>${settings.replaceBad ? 'on' : 'off'}</code>`,
+    `Режим: <code>${escapeHtml(settings.mode)}</code>`,
+    `Автозамены: <code>${onOff(settings.replaceBad)}</code>`,
+    `Merge Telegram-форматирования: <code>${onOff(settings.mergeEntities)}</code>`,
+    `Убирать разделители ИИ: <code>${onOff(settings.removeAiSeparators)}</code>`,
     '',
     '<b>Команды</b>',
+    '<code>/settings</code> — настройки кнопками',
     '<code>/mode auto</code> — автоопределение',
     '<code>/mode html</code> — вход как HTML',
     '<code>/mode md</code> — обычный Markdown от ChatGPT/DeepSeek/Z.ai',
     '<code>/mode tgmd</code> — Telegram MarkdownV2 без конвертации',
-    '<code>/replace on</code> — чинить заголовки, hr, чеклисты, LaTeX',
-    '<code>/replace off</code> — не чинить',
-    '<code>/settings</code> — показать настройки',
+    '<code>/replace on</code> / <code>off</code> — чинить заголовки, hr, чеклисты, LaTeX',
+    '<code>/merge on</code> / <code>off</code> — сохранять исходное форматирование Telegram',
+    '<code>/separators on</code> / <code>off</code> — убирать разделители ИИ',
     '',
-    '<b>Лучший режим по умолчанию</b>: <code>auto</code> + <code>replace on</code>.'
+    '<b>Лучший режим по умолчанию</b>: <code>auto</code>, <code>replace on</code>, <code>merge on</code>, <code>separators on</code>.'
   ].join('\n');
+}
+
+function parseBooleanArg(arg = '') {
+  if (['on', 'yes', 'true', '1', 'да'].includes(arg)) return true;
+  if (['off', 'no', 'false', '0', 'нет'].includes(arg)) return false;
+  return null;
 }
 
 async function handleCommand(chatId, text) {
@@ -300,13 +507,18 @@ async function handleCommand(chatId, text) {
   const command = commandRaw.split('@')[0].toLowerCase();
   const arg = (argRaw || '').toLowerCase();
 
-  if (command === '/start' || command === '/help' || command === '/settings') {
+  if (command === '/settings') {
+    await sendSettings(chatId);
+    return true;
+  }
+
+  if (command === '/start' || command === '/help') {
     await tg('sendMessage', { chat_id: chatId, text: helpText(settings), parse_mode: 'HTML', disable_web_page_preview: true });
     return true;
   }
 
   if (command === '/mode') {
-    const aliases = { markdown: 'md', telegrammarkdown: 'tgmd', telegram: 'tgmd', html: 'html', auto: 'auto', md: 'md', tgmd: 'tgmd' };
+    const aliases = { markdown: 'md', telegrammarkdown: 'tgmd', telegram_markdown: 'tgmd', telegram: 'tgmd', html: 'html', auto: 'auto', md: 'md', tgmd: 'tgmd' };
     const mode = aliases[arg];
     if (!mode) {
       await tg('sendMessage', { chat_id: chatId, text: 'Режимы: <code>auto</code>, <code>html</code>, <code>md</code>, <code>tgmd</code>.', parse_mode: 'HTML' });
@@ -314,37 +526,100 @@ async function handleCommand(chatId, text) {
     }
     const next = { ...settings, mode };
     await saveSettings(chatId, next);
-    await tg('sendMessage', { chat_id: chatId, text: `Готово. Режим: <code>${mode}</code>.`, parse_mode: 'HTML' });
+    await tg('sendMessage', { chat_id: chatId, text: `Готово. Режим: <code>${escapeHtml(mode)}</code>.`, parse_mode: 'HTML' });
     return true;
   }
 
   if (command === '/replace') {
-    const value = ['on', 'yes', 'true', '1', 'да'].includes(arg) ? true : ['off', 'no', 'false', '0', 'нет'].includes(arg) ? false : null;
+    const value = parseBooleanArg(arg);
     if (value === null) {
       await tg('sendMessage', { chat_id: chatId, text: 'Используй <code>/replace on</code> или <code>/replace off</code>.', parse_mode: 'HTML' });
       return true;
     }
     const next = { ...settings, replaceBad: value };
     await saveSettings(chatId, next);
-    await tg('sendMessage', { chat_id: chatId, text: `Готово. Автозамены: <code>${value ? 'on' : 'off'}</code>.`, parse_mode: 'HTML' });
+    await tg('sendMessage', { chat_id: chatId, text: `Готово. Автозамены: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
+    return true;
+  }
+
+  if (command === '/merge') {
+    const value = parseBooleanArg(arg);
+    if (value === null) {
+      await tg('sendMessage', { chat_id: chatId, text: 'Используй <code>/merge on</code> или <code>/merge off</code>.', parse_mode: 'HTML' });
+      return true;
+    }
+    const next = { ...settings, mergeEntities: value };
+    await saveSettings(chatId, next);
+    await tg('sendMessage', { chat_id: chatId, text: `Готово. Merge Telegram-форматирования: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
+    return true;
+  }
+
+  if (command === '/separators') {
+    const value = parseBooleanArg(arg);
+    if (value === null) {
+      await tg('sendMessage', { chat_id: chatId, text: 'Используй <code>/separators on</code> или <code>/separators off</code>.', parse_mode: 'HTML' });
+      return true;
+    }
+    const next = { ...settings, removeAiSeparators: value };
+    await saveSettings(chatId, next);
+    await tg('sendMessage', { chat_id: chatId, text: `Готово. Убирать разделители ИИ: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
     return true;
   }
 
   return false;
 }
 
+async function handleCallbackQuery(query) {
+  const chatId = query.message?.chat?.id;
+  const messageId = query.message?.message_id;
+  if (!chatId || !messageId || !query.data?.startsWith('s:')) return;
+
+  const settings = await getSettings(chatId);
+  const [, action, value] = query.data.split(':');
+  const next = { ...settings };
+
+  if (action === 'mode' && ['auto', 'html', 'md', 'tgmd'].includes(value)) {
+    next.mode = value;
+  } else if (action === 'toggle' && ['replaceBad', 'mergeEntities', 'removeAiSeparators'].includes(value)) {
+    next[value] = !next[value];
+  } else {
+    await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Неизвестная настройка' });
+    return;
+  }
+
+  await saveSettings(chatId, next);
+  await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Сохранено' });
+
+  await tg('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text: settingsText(next),
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: settingsKeyboard(next)
+  }).catch((error) => {
+    if (!/message is not modified/i.test(error.message)) throw error;
+  });
+}
+
 async function handleUpdate(update) {
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query);
+    return;
+  }
+
   const msg = update.message || update.edited_message;
   if (!msg?.chat?.id) return;
 
   const chatId = msg.chat.id;
   const input = msg.text || msg.caption || '';
+  const entities = msg.text ? (msg.entities || []) : (msg.caption_entities || []);
   if (!input.trim()) return;
 
   if (input.startsWith('/') && await handleCommand(chatId, input)) return;
 
   const settings = await getSettings(chatId);
-  const converted = convertMessage(input, settings);
+  const converted = convertMessage(input, settings, entities);
 
   for (const chunk of splitMessage(converted.text || '')) {
     try {
