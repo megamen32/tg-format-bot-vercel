@@ -1,146 +1,130 @@
-# Telegram Formatting Bot for Vercel
+# TG Format Bot for Vercel
 
-Бот принимает текст в Markdown / HTML / Telegram MarkdownV2 и отправляет обратно отрендеренное Telegram-сообщение.
-
-По умолчанию:
-
-- режим: `auto`
-- автозамены невозможных/неподдерживаемых конструкций: `on`
-- merge исходного Telegram-форматирования: `on`
-- удаление AI-разделителей между абзацами: `on`
+Telegram-бот для красивого рендера Markdown/HTML/Telegram MarkdownV2 в Telegram HTML.
 
 ## Что умеет
 
-- Markdown от ChatGPT / DeepSeek / Z.ai → Telegram HTML
-- HTML → безопасный Telegram HTML
-- Telegram MarkdownV2 → отправка как есть
-- заголовки `#`, `##`, `###` → жирные заголовки
-- списки → аккуратные списки
-- таблицы → моноширинный блок
-- блоки кода → `<pre>`
-- inline code → `<code>`
-- цитаты → `<blockquote>`
-- чеклисты → `☑` / `☐`
-- LaTeX `$...$` / `$$...$$` → моноширинный текст, потому что Telegram не рендерит LaTeX
-- удаление неподдерживаемого HTML
-- сохранение исходного Telegram-форматирования из `message.entities`, если пользователь отправил текст с жирным, курсивом, ссылками, кодом и т.д.
-- удаление разделителей, которые часто вставляют ИИ между абзацами: `—`, `---`, `___`, `***`
+- принимает Markdown от ChatGPT, DeepSeek, Z.ai и похожих сервисов;
+- конвертирует заголовки, списки, цитаты, код, таблицы, чеклисты и LaTeX в Telegram-совместимый вид;
+- умеет режимы `auto`, `html`, `md`, `tgmd`;
+- умеет merge исходного Telegram-форматирования из `message.entities` / `caption_entities`;
+- убирает типичные ИИ-разделители между абзацами: `—`, `---`, `___`, `***`;
+- `/settings` открывает личные настройки inline-кнопками;
+- если бот добавлен админом в канал или группу, он получает `my_chat_member`, запоминает чат и даёт управлять настройками в личке через `/channels`;
+- настройки каналов и групп хранятся отдельно от личных настроек;
+- проверка прав админа кэшируется на 1 час, а повторные нажатия не запускают пачку одинаковых `getChatMember`;
+- бот отвечает на inline-кнопку сразу, потом делает проверку и обновляет сообщение;
+- может автоматически редактировать посты канала, если в них найдено явное форматирование;
+- после каждого автоисправленного поста присылает администраторам в личку ссылку на пост, кнопку `Открыть пост` и кнопку `Откатить форматирование`;
+- автоматически регистрирует меню команд Telegram через `setMyCommands`.
 
-## Настройки
+## Переменные окружения Vercel
 
-Открой:
+Обязательные:
 
-```text
-/settings
+```env
+BOT_TOKEN=123456:ABC...
+TELEGRAM_SECRET_TOKEN=long-random-secret
 ```
 
-Бот покажет inline-кнопки:
+Опционально, но желательно для постоянных настроек, списка каналов, кэша прав и отката:
 
-- `Авто`
-- `HTML`
-- `Markdown`
-- `TelegramMarkdown`
-- `Автозамены`
-- `Merge Telegram-форматирования`
-- `Убирать разделители ИИ`
-
-Старые текстовые команды тоже работают:
-
-```text
-/start
-/help
-/settings
-/mode auto
-/mode html
-/mode md
-/mode tgmd
-/replace on
-/replace off
-/merge on
-/merge off
-/separators on
-/separators off
+```env
+KV_REST_API_URL=...
+KV_REST_API_TOKEN=...
 ```
 
-Режимы:
+Также поддерживаются старые имена Upstash:
 
-- `auto` — сам определяет HTML или Markdown
-- `html` — вход считается HTML
-- `md` — вход считается обычным Markdown
-- `tgmd` — вход считается Telegram MarkdownV2
-
-## Как работает merge Telegram-форматирования
-
-Telegram присылает боту не только `message.text`, но и `message.entities`: жирный, курсив, подчёркивание, зачёркивание, спойлеры, код, ссылки и т.д.
-
-Когда настройка `Merge Telegram-форматирования` включена, бот сначала встраивает эти entities в исходный текст как Telegram HTML, а потом дополнительно парсит Markdown. Это нужно для случаев, когда часть форматирования Telegram уже распознал сам, а часть осталась Markdown-текстом вроде `## Заголовок`, таблиц или чеклистов.
-
-Ограничение: в режиме `HTML` вход считается уже готовым HTML, поэтому entities не накладываются поверх него. В режиме `TelegramMarkdown` текст отправляется как MarkdownV2 без дополнительного merge.
-
-## Установка
-
-```bash
-npm install
+```env
+UPSTASH_REDIS_REST_URL=...
+UPSTASH_REDIS_REST_TOKEN=...
 ```
 
-## Деплой на Vercel
-
-1. Создай бота через [@BotFather](https://t.me/BotFather).
-2. Залей проект в GitHub.
-3. Импортируй репозиторий в Vercel.
-4. В Vercel добавь переменные окружения:
-
-```text
-BOT_TOKEN=123456:telegram_token_here
-TELEGRAM_SECRET_TOKEN=любая_длинная_строка_по_желанию
-```
-
-`TELEGRAM_SECRET_TOKEN` необязателен, но лучше включить.
+Без KV настройки будут храниться только в памяти serverless-функции и могут сбрасываться.
 
 ## Webhook
 
-После деплоя выполни одной строкой:
+После деплоя поставь webhook с нужными `allowed_updates`:
 
 ```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://YOUR_PROJECT.vercel.app/api/bot","secret_token":"YOUR_TELEGRAM_SECRET_TOKEN"}'
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://YOUR_PROJECT.vercel.app/api/bot","secret_token":"<TELEGRAM_SECRET_TOKEN>","allowed_updates":["message","edited_message","callback_query","channel_post","edited_channel_post","my_chat_member"]}'
 ```
 
-Если не используешь `TELEGRAM_SECRET_TOKEN`, убери поле `secret_token`:
-
-```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://YOUR_PROJECT.vercel.app/api/bot"}'
-```
-
-Проверить webhook:
+Проверка:
 
 ```bash
 curl "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
 ```
 
-Удалить webhook:
-
-```bash
-curl "https://api.telegram.org/bot<BOT_TOKEN>/deleteWebhook"
-```
-
-## Сохранение настроек
-
-Без базы настройки хранятся в памяти serverless-функции и могут сбрасываться.
-
-Для нормального сохранения подключи Upstash Redis или Vercel KV и добавь переменные:
+## Команды
 
 ```text
-KV_REST_API_URL=...
-KV_REST_API_TOKEN=...
+/start
+/help
+/settings
+/channels
+/set_commands
+/mode auto
+/mode html
+/mode md
+/mode tgmd
+/replace on|off
+/merge on|off
+/separators on|off
+/channel_edit on|off
 ```
 
-Также поддерживаются имена:
+`/settings` меняет личные настройки пользователя.
+
+`/channels` показывает каналы и группы, где бот был добавлен/повышен админом. Настройки выбранного чата меняются в личке и сохраняются по ключу `settings:chat:<channel_id>`.
+
+`/set_commands` вручную обновляет меню команд Telegram. Обычно это не нужно: бот сам вызывает `setMyCommands` при обработке webhook-запроса после холодного старта.
+
+## Каналы и группы
+
+1. Пользователь открывает бота в личке хотя бы один раз через `/start`, чтобы бот мог писать ему.
+2. Пользователь добавляет бота админом в канал или группу.
+3. Webhook получает `my_chat_member`.
+4. Бот запоминает чат за пользователем, который выполнил действие.
+5. Пользователь пишет боту `/channels` в личке.
+6. Бот показывает список чатов и настройки inline-кнопками.
+7. При открытии/изменении настроек бот отвечает на кнопку сразу, затем проверяет права через `getChatMember`.
+8. Результат проверки кэшируется на 1 час по паре `channelId:userId`.
+
+Для автоисправления постов в канале у бота должно быть право редактировать сообщения.
+
+## Откат автоисправления
+
+Когда бот изменил пост канала, он сохраняет исходный текст, исходные `entities`, ссылку на пост и отправляет известным администраторам в личку уведомление:
 
 ```text
-UPSTASH_REDIS_REST_URL=...
-UPSTASH_REDIS_REST_TOKEN=...
+Пост исправлен
+
+Канал: Название канала
+Пост: https://t.me/...
+
+Можно откатить исходное форматирование в течение 24 часов.
 ```
 
-## Важное ограничение Telegram
+Под уведомлением две кнопки:
 
-Telegram поддерживает не весь Markdown/HTML. Например, он не умеет настоящие Markdown-заголовки, таблицы, MathJax/KaTeX и произвольные `<div style="...">`. Поэтому бот конвертирует их в ближайший нормальный вид для Telegram.
+```text
+Открыть пост
+Откатить форматирование
+```
+
+Для публичных каналов ссылка будет вида `https://t.me/channel/123`. Для приватных каналов и супергрупп — `https://t.me/c/1234567890/123`; она откроется только у тех, у кого есть доступ к чату.
+
+После успешного отката бот тоже оставляет кнопку `Открыть пост`, чтобы сразу проверить результат.
+
+Откат хранится 24 часа. Чтобы кнопка работала после перезапусков serverless-функций, подключи KV/Upstash.
+
+## Важные ограничения Telegram
+
+- Бот не может первым написать пользователю, если пользователь раньше не нажимал `/start` в личке.
+- В `channel_post` обычно нет автора-админа, поэтому к постам применяются настройки канала, а не личные настройки конкретного админа.
+- Если webhook был установлен без `my_chat_member`, бот не узнает о добавлении в канал. Переустанови webhook командой выше.
+- Для отката бот должен всё ещё иметь право редактировать соответствующий пост.

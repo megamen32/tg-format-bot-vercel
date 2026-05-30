@@ -11,10 +11,20 @@ const DEFAULT_SETTINGS = {
   mode: 'auto', // auto | html | tgmd | md
   replaceBad: true,
   mergeEntities: true,
-  removeAiSeparators: true
+  removeAiSeparators: true,
+  autoEditChannelPosts: true
 };
 
 const memorySettings = new Map();
+const memoryJson = new Map();
+const memoryLocks = new Map();
+let commandsWereSet = false;
+
+const PERMISSION_CACHE_TTL_MS = 60 * 60 * 1000;
+const UNDO_TTL_MS = 24 * 60 * 60 * 1000;
+
+function userScope(userId) { return `user:${userId}`; }
+function chatScope(chatId) { return `chat:${chatId}`; }
 
 const md = new MarkdownIt({
   html: false,
@@ -390,15 +400,150 @@ async function kvSet(key, value) {
   return true;
 }
 
-async function getSettings(chatId) {
-  const key = `settings:${chatId}`;
+async function jsonGet(key) {
+  const stored = await kvGet(key);
+  if (stored !== null && stored !== undefined) return stored;
+  return memoryJson.get(key) || null;
+}
+
+async function jsonSet(key, value) {
+  memoryJson.set(key, value);
+  await kvSet(key, value).catch(() => false);
+}
+
+
+async function getPermissionCache(channelId, userId) {
+  return await jsonGet(`perm:${channelId}:${userId}`);
+}
+
+async function setPermissionCache(channelId, userId, allowed) {
+  const value = { allowed: Boolean(allowed), checkedAt: Date.now() };
+  await jsonSet(`perm:${channelId}:${userId}`, value);
+  return value;
+}
+
+async function checkUserCanManageChannelCached(channelId, userId, { force = false } = {}) {
+  if (!channelId || !userId) return { allowed: false, cached: false };
+  const cached = await getPermissionCache(channelId, userId);
+  if (!force && cached && Date.now() - Number(cached.checkedAt || 0) < PERMISSION_CACHE_TTL_MS) {
+    return { allowed: Boolean(cached.allowed), cached: true };
+  }
+
+  const lockKey = `perm:${channelId}:${userId}`;
+  if (memoryLocks.has(lockKey)) return await memoryLocks.get(lockKey);
+
+  const promise = (async () => {
+    const allowed = await checkUserCanManageChannel(channelId, userId);
+    const fresh = await setPermissionCache(channelId, userId, allowed);
+    if (allowed) await rememberChannelManager(channelId, userId);
+    return { allowed, cached: false, checkedAt: fresh.checkedAt };
+  })().finally(() => memoryLocks.delete(lockKey));
+
+  memoryLocks.set(lockKey, promise);
+  return await promise;
+}
+
+async function rememberChannelManager(channelId, userId) {
+  if (!channelId || !userId) return;
+  const key = `channelManagers:${channelId}`;
+  const list = await jsonGet(key) || [];
+  const next = [...new Set([...list.map(String), String(userId)])];
+  await jsonSet(key, next);
+}
+
+async function getChannelManagers(channelId) {
+  const list = await jsonGet(`channelManagers:${channelId}`) || [];
+  const channel = await jsonGet(`channel:${channelId}`);
+  if (channel?.addedBy) list.push(String(channel.addedBy));
+  return [...new Set(list.map(String).filter(Boolean))];
+}
+
+function makeToken() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function storeUndo(data) {
+  const token = makeToken();
+  await jsonSet(`undo:${token}`, { ...data, createdAt: Date.now() });
+  return token;
+}
+
+async function notifyChannelEdit(channelId, text, replyMarkup) {
+  const managers = await getChannelManagers(channelId);
+  for (const managerId of managers) {
+    await tg('sendMessage', {
+      chat_id: managerId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: replyMarkup
+    }).catch(() => null);
+  }
+}
+
+async function setupBotCommands() {
+  const commands = [
+    { command: 'start', description: 'Что умеет бот' },
+    { command: 'settings', description: 'Личные настройки форматирования' },
+    { command: 'channels', description: 'Каналы и группы с автоисправлением' },
+    { command: 'mode', description: 'Режим парсинга: auto/html/md/tgmd' },
+    { command: 'replace', description: 'Автозамены несовместимого on/off' },
+    { command: 'merge', description: 'Merge исходного форматирования on/off' },
+    { command: 'separators', description: 'Убирать ИИ-разделители on/off' },
+    { command: 'channel_edit', description: 'Автоисправление постов каналов on/off' },
+    { command: 'help', description: 'Помощь' }
+  ];
+  await tg('setMyCommands', { commands, scope: { type: 'default' } });
+}
+
+async function ensureBotCommands() {
+  if (commandsWereSet) return;
+  commandsWereSet = true;
+  await setupBotCommands().catch((error) => {
+    commandsWereSet = false;
+    console.error('setMyCommands failed', error);
+  });
+}
+
+async function rememberChannelForUser(userId, channel) {
+  if (!userId || !channel?.id) return;
+  const key = `channels:${userId}`;
+  const list = await jsonGet(key) || [];
+  const map = new Map(list.map((item) => [String(item.id), item]));
+  map.set(String(channel.id), { ...map.get(String(channel.id)), ...channel, updatedAt: Date.now() });
+  await jsonSet(key, [...map.values()]);
+  await jsonSet(`channel:${channel.id}`, { ...channel, updatedAt: Date.now() });
+  await rememberChannelManager(channel.id, userId);
+}
+
+async function getUserChannels(userId) {
+  return await jsonGet(`channels:${userId}`) || [];
+}
+
+async function checkUserCanManageChannel(channelId, userId) {
+  try {
+    const member = await tg('getChatMember', { chat_id: channelId, user_id: userId });
+    return ['creator', 'administrator'].includes(member.status);
+  } catch {
+    return false;
+  }
+}
+
+async function getSettings(scope) {
+  const key = `settings:${scope}`;
   const stored = await kvGet(key);
   if (stored) return { ...DEFAULT_SETTINGS, ...stored };
+
+  // Compatibility with older v1-v3 keys: settings:<numeric chat id>.
+  const legacyId = String(scope).replace(/^(user|chat):/, '');
+  const legacy = await kvGet(`settings:${legacyId}`);
+  if (legacy) return { ...DEFAULT_SETTINGS, ...legacy };
+
   return { ...DEFAULT_SETTINGS, ...(memorySettings.get(key) || {}) };
 }
 
-async function saveSettings(chatId, settings) {
-  const key = `settings:${chatId}`;
+async function saveSettings(scope, settings) {
+  const key = `settings:${scope}`;
   const normalized = { ...DEFAULT_SETTINGS, ...settings };
   memorySettings.set(key, normalized);
   await kvSet(key, normalized).catch(() => false);
@@ -421,52 +566,106 @@ function mark(label, active) {
   return active ? `✓ ${label}` : label;
 }
 
-function settingsText(settings) {
+function settingsText(settings, title = 'Настройки форматирования') {
   return [
-    '<b>Настройки форматирования</b>',
+    `<b>${escapeHtml(title)}</b>`,
     '',
     `Парсить как: <b>${escapeHtml(modeLabel(settings.mode))}</b>`,
     `Автозамены несовместимого: <b>${onOff(settings.replaceBad)}</b>`,
     `Merge исходного Telegram-форматирования: <b>${onOff(settings.mergeEntities)}</b>`,
     `Убирать разделители ИИ: <b>${onOff(settings.removeAiSeparators)}</b>`,
+    `Автоисправлять посты каналов: <b>${onOff(settings.autoEditChannelPosts)}</b>`,
     '',
     '<i>Пришли текст — я верну его уже отформатированным для Telegram.</i>'
   ].join('\n');
 }
 
-function settingsKeyboard(settings) {
+function settingsKeyboard(settings, scope = 'u') {
+  const prefix = scope.startsWith('chat:') ? `s|c|${scope.slice(5)}` : 's|u';
   return {
     inline_keyboard: [
       [
-        { text: mark('Авто', settings.mode === 'auto'), callback_data: 's:mode:auto' },
-        { text: mark('HTML', settings.mode === 'html'), callback_data: 's:mode:html' }
+        { text: mark('Авто', settings.mode === 'auto'), callback_data: `${prefix}|mode|auto` },
+        { text: mark('HTML', settings.mode === 'html'), callback_data: `${prefix}|mode|html` }
       ],
       [
-        { text: mark('Markdown', settings.mode === 'md'), callback_data: 's:mode:md' },
-        { text: mark('TelegramMarkdown', settings.mode === 'tgmd'), callback_data: 's:mode:tgmd' }
+        { text: mark('Markdown', settings.mode === 'md'), callback_data: `${prefix}|mode|md` },
+        { text: mark('TelegramMarkdown', settings.mode === 'tgmd'), callback_data: `${prefix}|mode|tgmd` }
       ],
       [
-        { text: `${settings.replaceBad ? '✓' : '×'} Автозамены`, callback_data: 's:toggle:replaceBad' }
+        { text: `${settings.replaceBad ? '✓' : '×'} Автозамены`, callback_data: `${prefix}|toggle|replaceBad` }
       ],
       [
-        { text: `${settings.mergeEntities ? '✓' : '×'} Merge Telegram-форматирования`, callback_data: 's:toggle:mergeEntities' }
+        { text: `${settings.mergeEntities ? '✓' : '×'} Merge Telegram-форматирования`, callback_data: `${prefix}|toggle|mergeEntities` }
       ],
       [
-        { text: `${settings.removeAiSeparators ? '✓' : '×'} Убирать разделители ИИ`, callback_data: 's:toggle:removeAiSeparators' }
-      ]
+        { text: `${settings.removeAiSeparators ? '✓' : '×'} Убирать разделители ИИ`, callback_data: `${prefix}|toggle|removeAiSeparators` }
+      ],
+      [
+        { text: `${settings.autoEditChannelPosts ? '✓' : '×'} Автоисправлять посты каналов`, callback_data: `${prefix}|toggle|autoEditChannelPosts` }
+      ],
+      ...(scope.startsWith('chat:') ? [[{ text: '← К списку каналов', callback_data: 'ch|list' }]] : [])
     ]
   };
 }
 
 async function sendSettings(chatId) {
-  const settings = await getSettings(chatId);
+  const scope = userScope(chatId);
+  const settings = await getSettings(scope);
   await tg('sendMessage', {
     chat_id: chatId,
-    text: settingsText(settings),
+    text: settingsText(settings, 'Личные настройки'),
     parse_mode: 'HTML',
     disable_web_page_preview: true,
-    reply_markup: settingsKeyboard(settings)
+    reply_markup: settingsKeyboard(settings, scope)
   });
+}
+
+function channelDisplayName(channel) {
+  return channel.username ? `@${channel.username}` : (channel.title || String(channel.id));
+}
+
+function getPostUrl(chat, messageId) {
+  if (!chat?.id || !messageId) return null;
+  if (chat.username) return `https://t.me/${chat.username}/${messageId}`;
+
+  const rawId = String(chat.id);
+  if (rawId.startsWith('-100')) {
+    return `https://t.me/c/${rawId.slice(4)}/${messageId}`;
+  }
+
+  return null;
+}
+
+function postLinkLine(postUrl) {
+  return postUrl
+    ? `Пост: ${escapeHtml(postUrl)}`
+    : 'Ссылка на пост недоступна.';
+}
+
+async function sendChannels(chatId, editMessageId = null) {
+  const channels = await getUserChannels(chatId);
+  const rows = [];
+  for (const channel of channels) {
+    rows.push([{ text: channelDisplayName(channel), callback_data: `ch|open|${channel.id}` }]);
+  }
+  const text = channels.length
+    ? '<b>Каналы</b>\n\nВыбери канал для настройки. Проверка прав кэшируется на час, кнопки отвечают сразу.'
+    : '<b>Каналы не найдены</b>\n\nДобавь бота админом в канал. Бот запомнит канал через <code>my_chat_member</code>. После этого вернись сюда и нажми /channels.';
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: rows.length ? rows : [[{ text: 'Обновить', callback_data: 'ch|list' }]] }
+  };
+  if (editMessageId) {
+    await tg('editMessageText', { ...payload, message_id: editMessageId }).catch(async (error) => {
+      if (!/message is not modified/i.test(error.message)) throw error;
+    });
+  } else {
+    await tg('sendMessage', payload);
+  }
 }
 
 function helpText(settings) {
@@ -475,14 +674,18 @@ function helpText(settings) {
     '',
     'Пришли текст в Markdown, HTML или Telegram MarkdownV2. Я верну его как красиво отформатированное Telegram-сообщение.',
     '',
+    'Можешь добавить меня админом в канал или группу с правом редактировать сообщения — я буду автоматически исправлять видимую Markdown/HTML-разметку в новых постах.',
+    '',
     '<b>Текущие настройки</b>',
     `Режим: <code>${escapeHtml(settings.mode)}</code>`,
     `Автозамены: <code>${onOff(settings.replaceBad)}</code>`,
     `Merge Telegram-форматирования: <code>${onOff(settings.mergeEntities)}</code>`,
     `Убирать разделители ИИ: <code>${onOff(settings.removeAiSeparators)}</code>`,
+    `Автоисправлять посты каналов: <code>${onOff(settings.autoEditChannelPosts)}</code>`,
     '',
     '<b>Команды</b>',
-    '<code>/settings</code> — настройки кнопками',
+    '<code>/settings</code> — личные настройки кнопками',
+    '<code>/channels</code> — каналы, где бот был добавлен админом',
     '<code>/mode auto</code> — автоопределение',
     '<code>/mode html</code> — вход как HTML',
     '<code>/mode md</code> — обычный Markdown от ChatGPT/DeepSeek/Z.ai',
@@ -490,8 +693,9 @@ function helpText(settings) {
     '<code>/replace on</code> / <code>off</code> — чинить заголовки, hr, чеклисты, LaTeX',
     '<code>/merge on</code> / <code>off</code> — сохранять исходное форматирование Telegram',
     '<code>/separators on</code> / <code>off</code> — убирать разделители ИИ',
+    '<code>/channel_edit on</code> / <code>off</code> — автоматически редактировать посты каналов',
     '',
-    '<b>Лучший режим по умолчанию</b>: <code>auto</code>, <code>replace on</code>, <code>merge on</code>, <code>separators on</code>.'
+    '<b>Лучший режим по умолчанию</b>: <code>auto</code>, <code>replace on</code>, <code>merge on</code>, <code>separators on</code>, <code>channel_edit on</code>.'
   ].join('\n');
 }
 
@@ -502,7 +706,8 @@ function parseBooleanArg(arg = '') {
 }
 
 async function handleCommand(chatId, text) {
-  const settings = await getSettings(chatId);
+  const scope = userScope(chatId);
+  const settings = await getSettings(scope);
   const [commandRaw, argRaw] = text.trim().split(/\s+/, 2);
   const command = commandRaw.split('@')[0].toLowerCase();
   const arg = (argRaw || '').toLowerCase();
@@ -512,8 +717,19 @@ async function handleCommand(chatId, text) {
     return true;
   }
 
+  if (command === '/channels') {
+    await sendChannels(chatId);
+    return true;
+  }
+
   if (command === '/start' || command === '/help') {
     await tg('sendMessage', { chat_id: chatId, text: helpText(settings), parse_mode: 'HTML', disable_web_page_preview: true });
+    return true;
+  }
+
+  if (command === '/set_commands') {
+    await setupBotCommands();
+    await tg('sendMessage', { chat_id: chatId, text: 'Команды бота обновлены в меню Telegram.' });
     return true;
   }
 
@@ -525,7 +741,7 @@ async function handleCommand(chatId, text) {
       return true;
     }
     const next = { ...settings, mode };
-    await saveSettings(chatId, next);
+    await saveSettings(scope, next);
     await tg('sendMessage', { chat_id: chatId, text: `Готово. Режим: <code>${escapeHtml(mode)}</code>.`, parse_mode: 'HTML' });
     return true;
   }
@@ -537,7 +753,7 @@ async function handleCommand(chatId, text) {
       return true;
     }
     const next = { ...settings, replaceBad: value };
-    await saveSettings(chatId, next);
+    await saveSettings(scope, next);
     await tg('sendMessage', { chat_id: chatId, text: `Готово. Автозамены: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
     return true;
   }
@@ -549,8 +765,20 @@ async function handleCommand(chatId, text) {
       return true;
     }
     const next = { ...settings, mergeEntities: value };
-    await saveSettings(chatId, next);
+    await saveSettings(scope, next);
     await tg('sendMessage', { chat_id: chatId, text: `Готово. Merge Telegram-форматирования: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
+    return true;
+  }
+
+  if (command === '/channel_edit') {
+    const value = parseBooleanArg(arg);
+    if (value === null) {
+      await tg('sendMessage', { chat_id: chatId, text: 'Используй <code>/channel_edit on</code> или <code>/channel_edit off</code>.', parse_mode: 'HTML' });
+      return true;
+    }
+    const next = { ...settings, autoEditChannelPosts: value };
+    await saveSettings(scope, next);
+    await tg('sendMessage', { chat_id: chatId, text: `Готово. Автоисправление постов каналов: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
     return true;
   }
 
@@ -561,7 +789,7 @@ async function handleCommand(chatId, text) {
       return true;
     }
     const next = { ...settings, removeAiSeparators: value };
-    await saveSettings(chatId, next);
+    await saveSettings(scope, next);
     await tg('sendMessage', { chat_id: chatId, text: `Готово. Убирать разделители ИИ: <code>${onOff(value)}</code>.`, parse_mode: 'HTML' });
     return true;
   }
@@ -572,39 +800,310 @@ async function handleCommand(chatId, text) {
 async function handleCallbackQuery(query) {
   const chatId = query.message?.chat?.id;
   const messageId = query.message?.message_id;
-  if (!chatId || !messageId || !query.data?.startsWith('s:')) return;
+  const userId = query.from?.id;
+  if (!chatId || !messageId || !query.data) return;
 
-  const settings = await getSettings(chatId);
-  const [, action, value] = query.data.split(':');
+  if (query.data === 'ch|list') {
+    await tg('answerCallbackQuery', { callback_query_id: query.id });
+    await sendChannels(chatId, messageId);
+    return;
+  }
+
+  if (query.data.startsWith('undo|')) {
+    await handleUndo(query, query.data.split('|')[1]);
+    return;
+  }
+
+  if (query.data.startsWith('ch|open|')) {
+    const channelId = query.data.split('|')[2];
+    await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Открываю настройки…' });
+    const permission = await checkUserCanManageChannelCached(channelId, userId);
+    if (!permission.allowed) {
+      await tg('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: 'Нет прав администратора для этого канала или бот не может проверить права.',
+        reply_markup: { inline_keyboard: [[{ text: '← К списку каналов', callback_data: 'ch|list' }]] }
+      }).catch(() => null);
+      return;
+    }
+    const channel = await jsonGet(`channel:${channelId}`) || { id: channelId, title: channelId };
+    const scope = chatScope(channelId);
+    const settings = await getSettings(scope);
+    await tg('answerCallbackQuery', { callback_query_id: query.id });
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: settingsText(settings, `Настройки канала ${channelDisplayName(channel)}`),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: settingsKeyboard(settings, scope)
+    }).catch((error) => {
+      if (!/message is not modified/i.test(error.message)) throw error;
+    });
+    return;
+  }
+
+  if (!query.data.startsWith('s|')) return;
+
+  const parts = query.data.split('|');
+  let scope;
+  let action;
+  let value;
+
+  if (parts[1] === 'u') {
+    scope = userScope(userId || chatId);
+    action = parts[2];
+    value = parts[3];
+  } else if (parts[1] === 'c') {
+    const channelId = parts[2];
+    await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Сохраняю…' });
+    const permission = await checkUserCanManageChannelCached(channelId, userId);
+    if (!permission.allowed) {
+      await tg('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: 'Нет прав администратора для этого канала или бот не может проверить права.',
+        reply_markup: { inline_keyboard: [[{ text: '← К списку каналов', callback_data: 'ch|list' }]] }
+      }).catch(() => null);
+      return;
+    }
+    scope = chatScope(channelId);
+    action = parts[3];
+    value = parts[4];
+  } else {
+    await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Неизвестная настройка' });
+    return;
+  }
+
+  const settings = await getSettings(scope);
   const next = { ...settings };
 
   if (action === 'mode' && ['auto', 'html', 'md', 'tgmd'].includes(value)) {
     next.mode = value;
-  } else if (action === 'toggle' && ['replaceBad', 'mergeEntities', 'removeAiSeparators'].includes(value)) {
+  } else if (action === 'toggle' && ['replaceBad', 'mergeEntities', 'removeAiSeparators', 'autoEditChannelPosts'].includes(value)) {
     next[value] = !next[value];
   } else {
     await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Неизвестная настройка' });
     return;
   }
 
-  await saveSettings(chatId, next);
-  await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Сохранено' });
+  await saveSettings(scope, next);
+  await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Сохранено' }).catch(() => null);
+
+  const title = scope.startsWith('chat:')
+    ? `Настройки канала ${channelDisplayName(await jsonGet(`channel:${scope.slice(5)}`) || { id: scope.slice(5) })}`
+    : 'Личные настройки';
 
   await tg('editMessageText', {
     chat_id: chatId,
     message_id: messageId,
-    text: settingsText(next),
+    text: settingsText(next, title),
     parse_mode: 'HTML',
     disable_web_page_preview: true,
-    reply_markup: settingsKeyboard(next)
+    reply_markup: settingsKeyboard(next, scope)
   }).catch((error) => {
     if (!/message is not modified/i.test(error.message)) throw error;
   });
 }
 
+async function handleMyChatMember(update) {
+  const chat = update.chat;
+  const actor = update.from;
+  const next = update.new_chat_member;
+  if (!chat?.id || !actor?.id || !next?.status) return;
+  if (!['channel', 'supergroup', 'group'].includes(chat.type)) return;
+
+  const isActive = ['member', 'administrator'].includes(next.status);
+  const isAdmin = next.status === 'administrator';
+  const channel = {
+    id: chat.id,
+    type: chat.type,
+    title: chat.title || chat.username || String(chat.id),
+    username: chat.username || '',
+    botStatus: next.status,
+    canEditMessages: Boolean(next.can_edit_messages),
+    active: isActive,
+    addedBy: actor.id
+  };
+
+  await rememberChannelForUser(actor.id, channel);
+
+  if (isAdmin) {
+    const scope = chatScope(chat.id);
+    const settings = await getSettings(scope);
+    await saveSettings(scope, settings);
+    await tg('sendMessage', {
+      chat_id: actor.id,
+      text: `<b>Бот добавлен админом в ${escapeHtml(channelDisplayName(channel))}</b>\n\nНастройки канала можно менять здесь, в личке.`,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Открыть настройки канала', callback_data: `ch|open|${chat.id}` }]]
+      }
+    }).catch(() => null);
+  }
+}
+
+
+function hasUsefulTelegramEntities(entities = []) {
+  const useful = new Set(['bold', 'italic', 'underline', 'strikethrough', 'spoiler', 'code', 'pre', 'text_link', 'text_mention', 'blockquote', 'expandable_blockquote']);
+  return (entities || []).some((entity) => useful.has(entity.type));
+}
+
+function hasExplicitMarkup(text = '', entities = []) {
+  const s = stripControlChars(text || '');
+  if (hasUsefulTelegramEntities(entities)) return true;
+  if (looksLikeHtml(s) || looksLikeMarkdown(s)) return true;
+
+  // Extra strict checks for common LLM/Telegram-visible markup that MarkdownIt may not catch.
+  return /(^|\s)(\*|_){1,3}\S[\s\S]*?\S\2{1,3}(?=\s|$)|~~\S[\s\S]*?\S~~|<\/?(?:b|i|u|s|code|pre|blockquote|strong|em)\b/i.test(s);
+}
+
+async function handleChannelPost(msg) {
+  const chatId = msg.chat?.id;
+  if (!chatId) return;
+
+  const input = msg.text || msg.caption || '';
+  const entities = msg.text ? (msg.entities || []) : (msg.caption_entities || []);
+  if (!input.trim()) return;
+
+  const settings = await getSettings(chatScope(chatId));
+  if (settings.autoEditChannelPosts === false) return;
+  if (!hasExplicitMarkup(input, entities)) return;
+
+  const converted = convertMessage(input, settings, entities);
+  const payload = {
+    chat_id: chatId,
+    message_id: msg.message_id,
+    parse_mode: converted.parse_mode,
+    disable_web_page_preview: true
+  };
+
+  const postUrl = getPostUrl(msg.chat, msg.message_id);
+  const channelTitle = msg.chat?.title || msg.chat?.username || String(chatId);
+  const undoToken = await storeUndo({
+    chatId,
+    messageId: msg.message_id,
+    kind: msg.text ? 'text' : 'caption',
+    original: input,
+    entities,
+    channelTitle,
+    postUrl
+  });
+
+  try {
+    if (msg.text) {
+      await tg('editMessageText', { ...payload, text: converted.text });
+    } else if (msg.caption) {
+      await tg('editMessageCaption', { ...payload, caption: converted.text });
+    }
+
+    const keyboard = [];
+    if (postUrl) keyboard.push([{ text: 'Открыть пост', url: postUrl }]);
+    keyboard.push([{ text: 'Откатить форматирование', callback_data: `undo|${undoToken}` }]);
+
+    await notifyChannelEdit(
+      chatId,
+      [
+        '<b>Пост исправлен</b>',
+        '',
+        `Канал: <b>${escapeHtml(channelTitle)}</b>`,
+        postLinkLine(postUrl),
+        '',
+        'Можно откатить исходное форматирование в течение 24 часов.'
+      ].join('\n'),
+      { inline_keyboard: keyboard }
+    );
+  } catch (error) {
+    if (!/message is not modified/i.test(error.message)) throw error;
+  }
+}
+
+async function handleUndo(query, token) {
+  const chatId = query.message?.chat?.id;
+  const messageId = query.message?.message_id;
+  const userId = query.from?.id;
+  await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Откатываю…' }).catch(() => null);
+
+  const data = await jsonGet(`undo:${token}`);
+  if (!data || Date.now() - Number(data.createdAt || 0) > UNDO_TTL_MS) {
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: 'Откат недоступен: запись устарела или не найдена.'
+    }).catch(() => null);
+    return;
+  }
+
+  const permission = await checkUserCanManageChannelCached(data.chatId, userId);
+  if (!permission.allowed) {
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: 'Откат недоступен: нет прав администратора для этого канала.'
+    }).catch(() => null);
+    return;
+  }
+
+  try {
+    if (data.kind === 'caption') {
+      await tg('editMessageCaption', {
+        chat_id: data.chatId,
+        message_id: data.messageId,
+        caption: data.original,
+        caption_entities: data.entities || []
+      });
+    } else {
+      await tg('editMessageText', {
+        chat_id: data.chatId,
+        message_id: data.messageId,
+        text: data.original,
+        entities: data.entities || [],
+        disable_web_page_preview: true
+      });
+    }
+    const keyboard = data.postUrl
+      ? { inline_keyboard: [[{ text: 'Открыть пост', url: data.postUrl }]] }
+      : undefined;
+
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: [
+        '<b>Откат выполнен</b>',
+        '',
+        `Канал: <b>${escapeHtml(data.channelTitle || String(data.chatId))}</b>`,
+        postLinkLine(data.postUrl)
+      ].join('\n'),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: keyboard
+    }).catch(() => null);
+  } catch (error) {
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: `Не удалось откатить: ${escapeHtml(error.message || 'ошибка Telegram')}`,
+      parse_mode: 'HTML'
+    }).catch(() => null);
+  }
+}
+
 async function handleUpdate(update) {
   if (update.callback_query) {
     await handleCallbackQuery(update.callback_query);
+    return;
+  }
+
+  if (update.my_chat_member) {
+    await handleMyChatMember(update.my_chat_member);
+    return;
+  }
+
+  const channelPost = update.channel_post || update.edited_channel_post;
+  if (channelPost) {
+    await handleChannelPost(channelPost);
     return;
   }
 
@@ -618,7 +1117,7 @@ async function handleUpdate(update) {
 
   if (input.startsWith('/') && await handleCommand(chatId, input)) return;
 
-  const settings = await getSettings(chatId);
+  const settings = await getSettings(userScope(chatId));
   const converted = convertMessage(input, settings, entities);
 
   for (const chunk of splitMessage(converted.text || '')) {
@@ -654,6 +1153,7 @@ export default async function handler(req, res) {
   }
 
   try {
+    await ensureBotCommands();
     await handleUpdate(req.body);
     return res.status(200).json({ ok: true });
   } catch (error) {
