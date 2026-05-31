@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Paste With Format — вставить с форматированием</title>
+  <meta name="description" content="Вставь Markdown или HTML и открой Telegram-бота, который вернёт сообщение с форматированием." />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e1621;
+      --panel: #17212b;
+      --panel2: #1d2b3a;
+      --text: #eef6ff;
+      --muted: #8ea0b2;
+      --blue: #2aabee;
+      --blue2: #229ed9;
+      --border: #26384a;
+      --danger: #ff6b6b;
+      --ok: #60d394;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top, #14304a 0, var(--bg) 38rem);
+      color: var(--text);
+      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 36px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: clamp(26px, 4vw, 44px); line-height: 1.05; letter-spacing: -0.04em; }
+    .lead { margin: 10px 0 0; color: var(--muted); max-width: 650px; }
+    .badge { border: 1px solid var(--border); background: rgba(23,33,43,.82); padding: 8px 10px; border-radius: 999px; color: var(--muted); white-space: nowrap; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    @media (min-width: 860px) { .grid { grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr); } }
+    .card { background: rgba(23,33,43,.92); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; box-shadow: 0 18px 60px rgba(0,0,0,.22); }
+    .card-head { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .card-title { font-weight: 700; }
+    textarea {
+      width: 100%; min-height: 420px; resize: vertical; display: block; border: 0; outline: 0;
+      background: transparent; color: var(--text); padding: 16px; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    .controls { display: grid; gap: 12px; padding: 16px; }
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
+    select, input[type="text"] {
+      width: 100%; border: 1px solid var(--border); background: #0f1a25; color: var(--text); border-radius: 12px; padding: 10px 12px; outline: 0;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    button, .button {
+      appearance: none; border: 1px solid transparent; background: var(--blue); color: white; border-radius: 12px;
+      padding: 11px 14px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    button:hover, .button:hover { background: var(--blue2); }
+    button.secondary, .button.secondary { background: #101b27; border-color: var(--border); color: var(--text); }
+    button.secondary:hover, .button.secondary:hover { background: var(--panel2); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .hint { color: var(--muted); font-size: 13px; }
+    .status { min-height: 44px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px; background: #0f1a25; color: var(--muted); overflow-wrap: anywhere; }
+    .status.ok { border-color: rgba(96,211,148,.45); color: var(--ok); }
+    .status.err { border-color: rgba(255,107,107,.45); color: var(--danger); }
+    .linkbox { display: none; gap: 8px; }
+    .linkbox.visible { display: grid; }
+    .preview {
+      white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; min-height: 160px; color: #dbe9f7;
+      border-top: 1px solid var(--border); background: #0f1a25;
+    }
+    code { background: rgba(255,255,255,.08); padding: 2px 5px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Вставить с форматированием</h1>
+        <p class="lead">Вставь Markdown или HTML из ChatGPT, DeepSeek, Z.ai и открой бота. Он вернёт Telegram-сообщение с нормальным форматированием.</p>
+      </div>
+      <div class="badge">Vercel + Telegram bot</div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <div class="card-head">
+          <div class="card-title">Текст</div>
+          <button class="secondary" id="sampleBtn" type="button">Пример</button>
+        </div>
+        <textarea id="text" spellcheck="false" placeholder="Вставь Markdown или HTML…\n\nНапример:\n<b>bold</b>\n\n## Заголовок\n**Жирный текст** и *курсив*."></textarea>
+      </section>
+
+      <aside class="card">
+        <div class="card-head">
+          <div class="card-title">Отправка</div>
+        </div>
+        <div class="controls">
+          <label>
+            Режим парсинга
+            <select id="mode">
+              <option value="auto">Авто</option>
+              <option value="html">HTML</option>
+              <option value="md">Markdown</option>
+              <option value="tgmd">Telegram MarkdownV2</option>
+            </select>
+          </label>
+
+          <div class="row">
+            <button id="openBtn" type="button">Открыть в боте</button>
+            <button id="makeLinkBtn" class="secondary" type="button">Создать ссылку</button>
+          </div>
+
+          <div id="status" class="status">Короткий текст попадёт прямо в deep link. Длинный текст будет сохранён через KV и передан в бота токеном.</div>
+
+          <div id="linkbox" class="linkbox">
+            <label>
+              Ссылка
+              <input id="linkInput" type="text" readonly />
+            </label>
+            <div class="row">
+              <button id="copyLinkBtn" class="secondary" type="button">Копировать ссылку</button>
+              <a id="openLink" class="button" target="_blank" rel="noopener noreferrer">Открыть</a>
+            </div>
+          </div>
+
+          <p class="hint">Прямая ссылка Telegram имеет ограничение: payload в <code>?start=</code> до 64 символов. Поэтому для длинного текста нужен KV/Upstash.</p>
+        </div>
+        <div id="preview" class="preview"></div>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    const textEl = document.getElementById('text');
+    const modeEl = document.getElementById('mode');
+    const statusEl = document.getElementById('status');
+    const linkboxEl = document.getElementById('linkbox');
+    const linkInputEl = document.getElementById('linkInput');
+    const openLinkEl = document.getElementById('openLink');
+    const previewEl = document.getElementById('preview');
+
+    const sample = `🧠 **Промпт Codex — разбор форматирования**\n\n> «You keep a slight but real independence.»\n\n## Что важно\n\n- **Жирный текст**\n- *Курсив*\n- \`код\`\n\n---\n\n<b>HTML тоже можно</b>`;
+
+    function setStatus(text, type = '') {
+      statusEl.className = 'status' + (type ? ' ' + type : '');
+      statusEl.textContent = text;
+    }
+
+    function updatePreview() {
+      const t = textEl.value || '';
+      previewEl.textContent = t ? t.slice(0, 900) + (t.length > 900 ? '\n…' : '') : 'Здесь будет краткий предпросмотр исходного текста.';
+    }
+
+    async function createLink() {
+      const text = textEl.value.trim();
+      if (!text) {
+        setStatus('Вставь текст.', 'err');
+        return null;
+      }
+
+      setStatus('Создаю ссылку…');
+      linkboxEl.classList.remove('visible');
+
+      const res = await fetch('/api/link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, mode: modeEl.value })
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.ok) {
+        setStatus(data.error || 'Не удалось создать ссылку.', 'err');
+        return null;
+      }
+
+      linkInputEl.value = data.url;
+      openLinkEl.href = data.url;
+      linkboxEl.classList.add('visible');
+      setStatus(`Ссылка готова. Хранение: ${data.storage}.`, 'ok');
+      return data.url;
+    }
+
+    document.getElementById('openBtn').addEventListener('click', async () => {
+      const url = await createLink();
+      if (url) window.open(url, '_blank', 'noopener,noreferrer');
+    });
+
+    document.getElementById('makeLinkBtn').addEventListener('click', createLink);
+
+    document.getElementById('copyLinkBtn').addEventListener('click', async () => {
+      if (!linkInputEl.value) return;
+      await navigator.clipboard.writeText(linkInputEl.value);
+      setStatus('Ссылка скопирована.', 'ok');
+    });
+
+    document.getElementById('sampleBtn').addEventListener('click', () => {
+      textEl.value = sample;
+      updatePreview();
+    });
+
+    textEl.addEventListener('input', updatePreview);
+
+    const params = new URLSearchParams(location.search);
+    if (params.has('text')) textEl.value = params.get('text') || '';
+    if (params.has('mode') && ['auto', 'html', 'md', 'tgmd'].includes(params.get('mode'))) modeEl.value = params.get('mode');
+    updatePreview();
+
+    if (window.Telegram?.WebApp) {
+      window.Telegram.WebApp.ready();
+      window.Telegram.WebApp.expand();
+    }
+  </script>
+</body>
+</html>

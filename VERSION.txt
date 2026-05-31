@@ -1,1 +1,1 @@
-version: v6-post-link-in-rollback-notifications
+version: v7-deeplink-web-app

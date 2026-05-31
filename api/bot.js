@@ -4,6 +4,8 @@ import { getChildren, isText, isTag } from 'domutils';
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SECRET_TOKEN = process.env.TELEGRAM_SECRET_TOKEN || '';
+const BOT_USERNAME_ENV = process.env.BOT_USERNAME || process.env.NEXT_PUBLIC_BOT_USERNAME || '';
+const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || process.env.NEXT_PUBLIC_APP_URL || process.env.APP_URL || '';
 const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
 
@@ -19,6 +21,8 @@ const memorySettings = new Map();
 const memoryJson = new Map();
 const memoryLocks = new Map();
 let commandsWereSet = false;
+let cachedBotUsername = '';
+let lastBaseUrl = '';
 
 const PERMISSION_CACHE_TTL_MS = 60 * 60 * 1000;
 const UNDO_TTL_MS = 24 * 60 * 60 * 1000;
@@ -462,6 +466,182 @@ function makeToken() {
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function makeShortToken() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24);
+}
+
+function toBase64Url(value = '') {
+  return Buffer.from(String(value), 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function fromBase64Url(value = '') {
+  const s = String(value).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = s + '='.repeat((4 - (s.length % 4)) % 4);
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function publicBaseUrlFromRequest(req) {
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return host ? `${proto}://${host}` : '';
+}
+
+function getAppUrl() {
+  const url = PUBLIC_APP_URL || lastBaseUrl;
+  return url ? String(url).replace(/\/$/, '') : '';
+}
+
+async function getBotUsername() {
+  if (BOT_USERNAME_ENV) return BOT_USERNAME_ENV.replace(/^@/, '');
+  if (cachedBotUsername) return cachedBotUsername;
+  const me = await tg('getMe', {});
+  cachedBotUsername = me?.username || '';
+  return cachedBotUsername;
+}
+
+async function createDeepLink(text, { mode = null } = {}) {
+  const username = await getBotUsername();
+  if (!username) throw new Error('BOT_USERNAME is not set and getMe did not return username');
+
+  const cleanText = stripControlChars(text || '').trim();
+  if (!cleanText) throw new Error('Text is empty');
+
+  const safeMode = ['auto', 'html', 'md', 'tgmd'].includes(mode) ? mode : null;
+  const prefix = safeMode ? ({ auto: 'a64_', html: 'h64_', md: 'm64_', tgmd: 't64_' }[safeMode]) : 'b64_';
+  const shortPayload = `${prefix}${toBase64Url(cleanText)}`;
+  if (shortPayload.length <= 64) {
+    return {
+      url: `https://t.me/${username}?start=${shortPayload}`,
+      payload: shortPayload,
+      storage: 'inline'
+    };
+  }
+
+  if (!KV_URL || !KV_TOKEN) {
+    throw new Error('Long deep links require KV_REST_API_URL and KV_REST_API_TOKEN');
+  }
+
+  const token = makeShortToken();
+  const payload = `fmt_${token}`;
+  await jsonSet(`deeplink:${token}`, {
+    text: cleanText,
+    mode: safeMode,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000
+  });
+
+  return {
+    url: `https://t.me/${username}?start=${payload}`,
+    payload,
+    storage: 'kv'
+  };
+}
+
+async function resolveDeepLinkPayload(payload = '') {
+  const value = String(payload || '').trim();
+  if (!value) return null;
+
+  const shortPrefixes = { b64_: null, a64_: 'auto', h64_: 'html', m64_: 'md', t64_: 'tgmd' };
+  for (const [prefix, mode] of Object.entries(shortPrefixes)) {
+    if (value.startsWith(prefix)) {
+      return { text: fromBase64Url(value.slice(prefix.length)), mode, storage: 'inline' };
+    }
+  }
+
+  if (value.startsWith('fmt_')) {
+    const token = value.slice(4);
+    const data = await jsonGet(`deeplink:${token}`);
+    if (!data?.text) return null;
+    if (data.expiresAt && Date.now() > Number(data.expiresAt)) return null;
+    return { ...data, storage: 'kv' };
+  }
+
+  return null;
+}
+
+function appButtonRows() {
+  const appUrl = getAppUrl();
+  return appUrl
+    ? [[{ text: 'Открыть веб-конвертер', url: appUrl }]]
+    : [];
+}
+
+async function sendAppLink(chatId) {
+  const appUrl = getAppUrl();
+  if (!appUrl) {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: 'Ссылка на веб-конвертер не настроена. Добавь env PUBLIC_APP_URL=https://YOUR_PROJECT.vercel.app или включи Vercel System Environment Variables.'
+    });
+    return;
+  }
+
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: [
+      '<b>Веб-конвертер</b>',
+      '',
+      'Там можно вставить Markdown/HTML, получить ссылку открытия бота с текстом или просто скопировать текст.',
+      '',
+      escapeHtml(appUrl)
+    ].join('\n'),
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: appButtonRows() }
+  });
+}
+
+async function handleStartPayload(chatId, payload, settings) {
+  const data = await resolveDeepLinkPayload(payload);
+  if (!data?.text) {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: [
+        'Не удалось прочитать текст из ссылки.',
+        '',
+        'Для короткого текста используй payload <code>b64_...</code>. Для длинного текста нужен /api/link и подключённый KV.'
+      ].join('\n'),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: appButtonRows() }
+    });
+    return;
+  }
+
+  const localSettings = data.mode ? { ...settings, mode: data.mode } : settings;
+  const converted = convertMessage(data.text, localSettings, []);
+  const chunks = splitMessage(converted.text || '');
+
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: `<b>Готово. Отформатированный текст${data.mode ? `, режим ${escapeHtml(data.mode)}` : ''}:</b>`,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: appButtonRows() }
+  }).catch(() => null);
+
+  for (const chunk of chunks) {
+    try {
+      await tg('sendMessage', {
+        chat_id: chatId,
+        text: chunk,
+        parse_mode: converted.parse_mode,
+        disable_web_page_preview: true
+      });
+    } catch {
+      const fallback = plainTextFromHtmlish(chunk);
+      await tg('sendMessage', {
+        chat_id: chatId,
+        text: fallback.slice(0, 3900) || 'Не удалось отрендерить: Telegram отклонил разметку.'
+      });
+    }
+  }
+}
+
 async function storeUndo(data) {
   const token = makeToken();
   await jsonSet(`undo:${token}`, { ...data, createdAt: Date.now() });
@@ -483,17 +663,27 @@ async function notifyChannelEdit(channelId, text, replyMarkup) {
 
 async function setupBotCommands() {
   const commands = [
-    { command: 'start', description: 'Что умеет бот' },
+    { command: 'start', description: 'Что умеет бот и deep links' },
+    { command: 'help', description: 'Помощь' },
     { command: 'settings', description: 'Личные настройки форматирования' },
     { command: 'channels', description: 'Каналы и группы с автоисправлением' },
+    { command: 'app', description: 'Открыть веб-конвертер' },
+    { command: 'link', description: 'Создать ссылку на бота с текстом' },
     { command: 'mode', description: 'Режим парсинга: auto/html/md/tgmd' },
     { command: 'replace', description: 'Автозамены несовместимого on/off' },
     { command: 'merge', description: 'Merge исходного форматирования on/off' },
     { command: 'separators', description: 'Убирать ИИ-разделители on/off' },
     { command: 'channel_edit', description: 'Автоисправление постов каналов on/off' },
-    { command: 'help', description: 'Помощь' }
+    { command: 'set_commands', description: 'Обновить команды в меню Telegram' }
   ];
   await tg('setMyCommands', { commands, scope: { type: 'default' } });
+
+  const appUrl = getAppUrl();
+  if (appUrl) {
+    await tg('setChatMenuButton', {
+      menu_button: { type: 'web_app', text: 'Форматтер', web_app: { url: appUrl } }
+    }).catch(() => null);
+  }
 }
 
 async function ensureBotCommands() {
@@ -674,6 +864,8 @@ function helpText(settings) {
     '',
     'Пришли текст в Markdown, HTML или Telegram MarkdownV2. Я верну его как красиво отформатированное Telegram-сообщение.',
     '',
+    'Ещё можно открыть меня по deep link с текстом: короткий текст передаётся прямо в <code>start</code>, длинный — через временный KV-токен из <code>/api/link</code>.',
+    '',
     'Можешь добавить меня админом в канал или группу с правом редактировать сообщения — я буду автоматически исправлять видимую Markdown/HTML-разметку в новых постах.',
     '',
     '<b>Текущие настройки</b>',
@@ -686,6 +878,8 @@ function helpText(settings) {
     '<b>Команды</b>',
     '<code>/settings</code> — личные настройки кнопками',
     '<code>/channels</code> — каналы, где бот был добавлен админом',
+    '<code>/app</code> — веб-конвертер',
+    '<code>/link текст</code> — создать ссылку, которая откроет бота с этим текстом',
     '<code>/mode auto</code> — автоопределение',
     '<code>/mode html</code> — вход как HTML',
     '<code>/mode md</code> — обычный Markdown от ChatGPT/DeepSeek/Z.ai',
@@ -708,9 +902,53 @@ function parseBooleanArg(arg = '') {
 async function handleCommand(chatId, text) {
   const scope = userScope(chatId);
   const settings = await getSettings(scope);
-  const [commandRaw, argRaw] = text.trim().split(/\s+/, 2);
+  const trimmed = text.trim();
+  const [commandRaw, argRaw] = trimmed.split(/\s+/, 2);
   const command = commandRaw.split('@')[0].toLowerCase();
+  const argsFull = trimmed.slice(commandRaw.length).trim();
   const arg = (argRaw || '').toLowerCase();
+
+  if (command === '/start' && argsFull) {
+    await handleStartPayload(chatId, argsFull, settings);
+    return true;
+  }
+
+  if (command === '/app') {
+    await sendAppLink(chatId);
+    return true;
+  }
+
+  if (command === '/link') {
+    if (!argsFull) {
+      await tg('sendMessage', { chat_id: chatId, text: 'Используй: <code>/link &lt;b&gt;bold&lt;/b&gt;</code>', parse_mode: 'HTML' });
+      return true;
+    }
+    try {
+      const link = await createDeepLink(argsFull);
+      await tg('sendMessage', {
+        chat_id: chatId,
+        text: [
+          '<b>Ссылка готова</b>',
+          '',
+          `<code>${escapeHtml(link.url)}</code>`,
+          '',
+          `Хранение: <code>${escapeHtml(link.storage)}</code>`
+        ].join('\n'),
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: 'Открыть бота с текстом', url: link.url }], ...appButtonRows()] }
+      });
+    } catch (error) {
+      await tg('sendMessage', {
+        chat_id: chatId,
+        text: `Не удалось создать ссылку: ${escapeHtml(error.message || 'ошибка')}`,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: appButtonRows() }
+      });
+    }
+    return true;
+  }
 
   if (command === '/settings') {
     await sendSettings(chatId);
@@ -723,7 +961,13 @@ async function handleCommand(chatId, text) {
   }
 
   if (command === '/start' || command === '/help') {
-    await tg('sendMessage', { chat_id: chatId, text: helpText(settings), parse_mode: 'HTML', disable_web_page_preview: true });
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: helpText(settings),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: appButtonRows() }
+    });
     return true;
   }
 
@@ -1144,6 +1388,7 @@ async function handleUpdate(update) {
 
 export default async function handler(req, res) {
   if (!BOT_TOKEN) return res.status(500).send('BOT_TOKEN is not set');
+  lastBaseUrl = PUBLIC_APP_URL || publicBaseUrlFromRequest(req) || lastBaseUrl;
 
   if (req.method === 'GET') return res.status(200).send('OK');
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
