@@ -276,3 +276,8 @@ https://YOUR_PROJECT.vercel.app/?text=%3Cb%3Ebold%3C%2Fb%3E&mode=html
 - Если webhook был установлен без `my_chat_member`, бот не узнает о добавлении в канал. Переустанови webhook командой выше.
 - Для отката бот должен всё ещё иметь право редактировать соответствующий пост.
 - Deep link `start` не подходит для прямой передачи длинного текста. Для этого нужен KV-токен через `/api/link`.
+
+## Screenshot
+
+![Telegram Format Bot screenshot](docs/screenshots/home.png)
+
